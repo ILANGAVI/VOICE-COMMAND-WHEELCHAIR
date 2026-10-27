@@ -1,0 +1,222 @@
+/*
+  Voice Command Wheelchair - Tinkercad prototype
+  Team Sparkle | Seva First Innovation Challenge 2026
+
+  Commands (type one letter in the Serial Monitor):
+    F = Forward   B = Backward   L = Left   R = Right   S = Stop
+
+  Board: Arduino Uno (stands in for ESP32-S3 in Tinkercad)
+*/
+
+// ---------- Pin map ----------
+const byte PIN_IN1   = 2;   // L293D input 1  (left motor)
+const byte PIN_IN2   = 3;   // L293D input 2  (left motor)
+const byte PIN_IN3   = 4;   // L293D input 3  (right motor)
+const byte PIN_IN4   = 7;   // L293D input 4  (right motor)
+const byte PIN_ENA   = 5;   // L293D enable 1 (PWM, left motor speed)
+const byte PIN_ENB   = 6;   // L293D enable 2 (PWM, right motor speed)
+const byte PIN_TRIG  = 8;   // ultrasonic sensor trigger
+const byte PIN_ECHO  = 9;   // ultrasonic sensor echo
+const byte PIN_BUZZ  = 10;  // buzzer
+const byte PIN_GREEN = 11;  // green LED (moving)
+const byte PIN_RED   = 12;  // red LED (stopped / warning)
+const byte PIN_ESTOP = A0;  // emergency-stop button to GND (INPUT_PULLUP)
+
+// ---------- Settings you can tune ----------
+const int  OBSTACLE_CM      = 30;   // stop if something is closer than this
+const int  SPEED_FORWARD    = 220;  // PWM 0-255
+const int  SPEED_BACKWARD   = 120;  // slower in reverse for safety
+const int  SPEED_TURN       = 150;  // slower when turning
+const int  RAMP_STEP        = 10;   // PWM added at every ramp tick
+const unsigned long RAMP_INTERVAL_MS   = 40;   // time between ramp ticks
+const unsigned long SENSOR_INTERVAL_MS = 100;  // time between distance checks
+
+// ---------- Directions ----------
+const byte DIR_STOP     = 0;
+const byte DIR_FORWARD  = 1;
+const byte DIR_BACKWARD = 2;
+const byte DIR_LEFT     = 3;
+const byte DIR_RIGHT    = 4;
+
+// ---------- State ----------
+byte currentDir   = DIR_STOP;
+int  currentSpeed = 0;   // PWM actually being sent
+int  targetSpeed  = 0;   // PWM we are ramping towards
+bool eStopActive  = false;
+unsigned long lastRamp   = 0;
+unsigned long lastSensor = 0;
+
+// ---------- Motor helpers ----------
+void driveMotor(byte in1, byte in2, byte en, int speed) {
+  if (speed > 0) {
+    digitalWrite(in1, HIGH);
+    digitalWrite(in2, LOW);
+  } else if (speed < 0) {
+    digitalWrite(in1, LOW);
+    digitalWrite(in2, HIGH);
+  } else {
+    digitalWrite(in1, LOW);
+    digitalWrite(in2, LOW);
+  }
+  analogWrite(en, abs(speed));
+}
+
+void applyMotors() {
+  int left = 0;
+  int right = 0;
+  if (currentDir == DIR_FORWARD)  { left =  currentSpeed; right =  currentSpeed; }
+  if (currentDir == DIR_BACKWARD) { left = -currentSpeed; right = -currentSpeed; }
+  if (currentDir == DIR_LEFT)     { left = -currentSpeed; right =  currentSpeed; }
+  if (currentDir == DIR_RIGHT)    { left =  currentSpeed; right = -currentSpeed; }
+
+  driveMotor(PIN_IN1, PIN_IN2, PIN_ENA, left);
+  driveMotor(PIN_IN3, PIN_IN4, PIN_ENB, right);
+
+  digitalWrite(PIN_GREEN, currentSpeed > 0 ? HIGH : LOW);
+  digitalWrite(PIN_RED,   currentSpeed > 0 ? LOW  : HIGH);
+}
+
+// Stop at once (no ramp). Used for Stop, obstacle, E-stop and invalid commands.
+void stopNow(const char *reason) {
+  currentDir   = DIR_STOP;
+  currentSpeed = 0;
+  targetSpeed  = 0;
+  applyMotors();
+  Serial.print("STOPPED: ");
+  Serial.println(reason);
+}
+
+void beepWarning() {
+  tone(PIN_BUZZ, 1000, 200);
+}
+
+// ---------- Sensor ----------
+long readDistanceCm() {
+  digitalWrite(PIN_TRIG, LOW);
+  delayMicroseconds(2);
+  digitalWrite(PIN_TRIG, HIGH);
+  delayMicroseconds(10);
+  digitalWrite(PIN_TRIG, LOW);
+
+  long duration = pulseIn(PIN_ECHO, HIGH, 30000UL);  // time out after 30 ms
+  if (duration == 0) {
+    return 999;  // nothing detected
+  }
+  return (long)(duration * 0.0343 / 2.0);
+}
+
+// ---------- Commands ----------
+void startMove(byte dir, int speed, const char *name) {
+  if (dir == DIR_FORWARD && readDistanceCm() < OBSTACLE_CM) {
+    beepWarning();
+    stopNow("obstacle ahead, forward refused");
+    return;
+  }
+  if (dir != currentDir) {
+    currentSpeed = 0;   // short stop before changing direction
+    currentDir = dir;
+    applyMotors();
+  }
+  targetSpeed = speed;
+  Serial.print("Moving: ");
+  Serial.println(name);
+}
+
+void processCommand(char c) {
+  if (eStopActive) {
+    Serial.println("E-stop is pressed - command ignored");
+    return;
+  }
+  switch (c) {
+    case 'F': startMove(DIR_FORWARD,  SPEED_FORWARD,  "forward");  break;
+    case 'B': startMove(DIR_BACKWARD, SPEED_BACKWARD, "backward"); break;
+    case 'L': startMove(DIR_LEFT,     SPEED_TURN,     "left");     break;
+    case 'R': startMove(DIR_RIGHT,    SPEED_TURN,     "right");    break;
+    case 'S': stopNow("stop command");                             break;
+    default:
+      beepWarning();
+      stopNow("invalid command");
+      break;
+  }
+}
+
+void handleSerial() {
+  while (Serial.available() > 0) {
+    char c = toupper(Serial.read());
+    if (c == '\n' || c == '\r' || c == ' ') {
+      continue;
+    }
+    processCommand(c);
+  }
+}
+
+// ---------- Safety checks ----------
+void handleEStop() {
+  bool pressed = (digitalRead(PIN_ESTOP) == LOW);
+  if (pressed && !eStopActive) {
+    eStopActive = true;
+    beepWarning();
+    stopNow("EMERGENCY STOP pressed");
+  } else if (!pressed && eStopActive) {
+    eStopActive = false;
+    Serial.println("E-stop released - send a command to move");
+  }
+}
+
+void checkObstacle() {
+  if (currentDir != DIR_FORWARD || currentSpeed == 0) {
+    return;
+  }
+  if (millis() - lastSensor < SENSOR_INTERVAL_MS) {
+    return;
+  }
+  lastSensor = millis();
+  if (readDistanceCm() < OBSTACLE_CM) {
+    beepWarning();
+    stopNow("obstacle detected");
+  }
+}
+
+// Gradual speed-up so the chair does not jerk.
+void updateRamp() {
+  if (currentDir == DIR_STOP || currentSpeed >= targetSpeed) {
+    return;
+  }
+  if (millis() - lastRamp < RAMP_INTERVAL_MS) {
+    return;
+  }
+  lastRamp = millis();
+  currentSpeed += RAMP_STEP;
+  if (currentSpeed > targetSpeed) {
+    currentSpeed = targetSpeed;
+  }
+  applyMotors();
+}
+
+// ---------- Arduino entry points ----------
+void setup() {
+  pinMode(PIN_IN1, OUTPUT);
+  pinMode(PIN_IN2, OUTPUT);
+  pinMode(PIN_IN3, OUTPUT);
+  pinMode(PIN_IN4, OUTPUT);
+  pinMode(PIN_ENA, OUTPUT);
+  pinMode(PIN_ENB, OUTPUT);
+  pinMode(PIN_TRIG, OUTPUT);
+  pinMode(PIN_ECHO, INPUT);
+  pinMode(PIN_BUZZ, OUTPUT);
+  pinMode(PIN_GREEN, OUTPUT);
+  pinMode(PIN_RED, OUTPUT);
+  pinMode(PIN_ESTOP, INPUT_PULLUP);
+
+  Serial.begin(9600);
+  stopNow("system ready");
+  Serial.println("Voice Command Wheelchair - Team Sparkle");
+  Serial.println("Type one letter: F=Forward B=Backward L=Left R=Right S=Stop");
+}
+
+void loop() {
+  handleEStop();     // highest priority
+  handleSerial();    // read commands
+  checkObstacle();   // auto-stop near obstacles
+  updateRamp();      // smooth speed-up
+}
